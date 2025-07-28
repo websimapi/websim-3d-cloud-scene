@@ -121,137 +121,255 @@ class CloudScene {
     }
     
     createCloudMaterials() {
-        // Base cloud material
-        const cloudMaterial1 = new THREE.ShaderMaterial({
+        // Volumetric cloud material with raymarching
+        const volumetricCloudMaterial = new THREE.ShaderMaterial({
             uniforms: {
                 time: { value: 0 },
                 density: { value: 1.0 },
-                opacity: { value: 0.8 }
+                opacity: { value: 0.8 },
+                lightDirection: { value: new THREE.Vector3(1, 1, 0.5).normalize() },
+                cloudColor: { value: new THREE.Color(1.0, 1.0, 1.0) },
+                shadowColor: { value: new THREE.Color(0.3, 0.3, 0.5) },
+                cameraPosition: { value: new THREE.Vector3() }
             },
             vertexShader: `
-                varying vec3 vPosition;
-                varying vec3 vNormal;
-                uniform float time;
-                
-                // Simple noise function
-                float noise(vec3 p) {
-                    return sin(p.x * 2.0 + time * 0.5) * sin(p.y * 1.5 + time * 0.3) * sin(p.z * 1.8 + time * 0.4) * 0.5 + 0.5;
-                }
+                varying vec3 vWorldPosition;
+                varying vec3 vLocalPosition;
                 
                 void main() {
-                    vPosition = position;
-                    vNormal = normal;
-                    
-                    vec3 pos = position;
-                    float n = noise(pos * 0.1) * 0.3;
-                    pos += normal * n;
-                    
-                    gl_Position = projectionMatrix * modelViewMatrix * vec4(pos, 1.0);
+                    vLocalPosition = position;
+                    vec4 worldPosition = modelMatrix * vec4(position, 1.0);
+                    vWorldPosition = worldPosition.xyz;
+                    gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
                 }
             `,
             fragmentShader: `
-                varying vec3 vPosition;
-                varying vec3 vNormal;
                 uniform float time;
                 uniform float density;
                 uniform float opacity;
+                uniform vec3 lightDirection;
+                uniform vec3 cloudColor;
+                uniform vec3 shadowColor;
+                uniform vec3 cameraPosition;
                 
-                float noise(vec3 p) {
-                    return sin(p.x * 3.0 + time * 0.2) * sin(p.y * 2.5 + time * 0.1) * sin(p.z * 2.8 + time * 0.15) * 0.5 + 0.5;
+                varying vec3 vWorldPosition;
+                varying vec3 vLocalPosition;
+                
+                // Improved 3D noise function
+                vec3 mod289(vec3 x) {
+                    return x - floor(x * (1.0 / 289.0)) * 289.0;
+                }
+                
+                vec4 mod289(vec4 x) {
+                    return x - floor(x * (1.0 / 289.0)) * 289.0;
+                }
+                
+                vec4 permute(vec4 x) {
+                    return mod289(((x * 34.0) + 1.0) * x);
+                }
+                
+                vec4 taylorInvSqrt(vec4 r) {
+                    return 1.79284291400159 - 0.85373472095314 * r;
+                }
+                
+                float snoise(vec3 v) {
+                    const vec2 C = vec2(1.0/6.0, 1.0/3.0);
+                    const vec4 D = vec4(0.0, 0.5, 1.0, 2.0);
+                    
+                    vec3 i = floor(v + dot(v, C.yyy));
+                    vec3 x0 = v - i + dot(i, C.xxx);
+                    
+                    vec3 g = step(x0.yzx, x0.xyz);
+                    vec3 l = 1.0 - g;
+                    vec3 i1 = min(g.xyz, l.zxy);
+                    vec3 i2 = max(g.xyz, l.zxy);
+                    
+                    vec3 x1 = x0 - i1 + C.xxx;
+                    vec3 x2 = x0 - i2 + C.yyy;
+                    vec3 x3 = x0 - D.yyy;
+                    
+                    i = mod289(i);
+                    vec4 p = permute(permute(permute(
+                        i.z + vec4(0.0, i1.z, i2.z, 1.0))
+                        + i.y + vec4(0.0, i1.y, i2.y, 1.0))
+                        + i.x + vec4(0.0, i1.x, i2.x, 1.0));
+                    
+                    float n_ = 0.142857142857;
+                    vec3 ns = n_ * D.wyz - D.xzx;
+                    
+                    vec4 j = p - 49.0 * floor(p * ns.z * ns.z);
+                    
+                    vec4 x_ = floor(j * ns.z);
+                    vec4 y_ = floor(j - 7.0 * x_);
+                    
+                    vec4 x = x_ * ns.x + ns.yyyy;
+                    vec4 y = y_ * ns.x + ns.yyyy;
+                    vec4 h = 1.0 - abs(x) - abs(y);
+                    
+                    vec4 b0 = vec4(x.xy, y.xy);
+                    vec4 b1 = vec4(x.zw, y.zw);
+                    
+                    vec4 s0 = floor(b0) * 2.0 + 1.0;
+                    vec4 s1 = floor(b1) * 2.0 + 1.0;
+                    vec4 sh = -step(h, vec4(0.0));
+                    
+                    vec4 a0 = b0.xzyw + s0.xzyw * sh.xxyy;
+                    vec4 a1 = b1.xzyw + s1.xzyw * sh.zzww;
+                    
+                    vec3 p0 = vec3(a0.xy, h.x);
+                    vec3 p1 = vec3(a0.zw, h.y);
+                    vec3 p2 = vec3(a1.xy, h.z);
+                    vec3 p3 = vec3(a1.zw, h.w);
+                    
+                    vec4 norm = taylorInvSqrt(vec4(dot(p0,p0), dot(p1,p1), dot(p2, p2), dot(p3,p3)));
+                    p0 *= norm.x;
+                    p1 *= norm.y;
+                    p2 *= norm.z;
+                    p3 *= norm.w;
+                    
+                    vec4 m = max(0.6 - vec4(dot(p0,p0), dot(p1,p1), dot(p2, p2), dot(p3,p3)), 0.0);
+                    m = m * m;
+                    return 42.0 * dot(m*m, vec4(dot(p0,x0), dot(p1,x1), dot(p2,x2), dot(p3,x3)));
+                }
+                
+                // Fractal noise for cloud density
+                float fbm(vec3 p) {
+                    float value = 0.0;
+                    float amplitude = 0.5;
+                    float frequency = 1.0;
+                    
+                    for(int i = 0; i < 5; i++) {
+                        value += amplitude * snoise(p * frequency);
+                        amplitude *= 0.5;
+                        frequency *= 2.0;
+                    }
+                    return value;
+                }
+                
+                // Cloud density function
+                float getCloudDensity(vec3 pos) {
+                    vec3 animatedPos = pos + vec3(time * 0.1, time * 0.05, time * 0.08);
+                    
+                    // Base cloud shape
+                    float baseShape = fbm(animatedPos * 0.1);
+                    
+                    // Detail layers
+                    float detail1 = fbm(animatedPos * 0.3) * 0.5;
+                    float detail2 = fbm(animatedPos * 0.6) * 0.25;
+                    float detail3 = fbm(animatedPos * 1.2) * 0.125;
+                    
+                    float cloudDensity = baseShape + detail1 + detail2 + detail3;
+                    cloudDensity = smoothstep(0.1, 0.8, cloudDensity) * density;
+                    
+                    // Distance falloff from center
+                    float dist = length(pos) / 8.0;
+                    cloudDensity *= smoothstep(1.0, 0.7, dist);
+                    
+                    return max(0.0, cloudDensity);
+                }
+                
+                // Simple light scattering
+                float henyeyGreenstein(float cosTheta, float g) {
+                    float g2 = g * g;
+                    return (1.0 - g2) / (4.0 * 3.14159 * pow(1.0 + g2 - 2.0 * g * cosTheta, 1.5));
                 }
                 
                 void main() {
-                    vec3 lightDir = normalize(vec3(1.0, 1.0, 0.5));
-                    float NdotL = dot(vNormal, lightDir) * 0.5 + 0.5;
+                    vec3 rayDir = normalize(vWorldPosition - cameraPosition);
+                    vec3 rayStart = vLocalPosition;
                     
-                    float n1 = noise(vPosition * 0.05);
-                    float n2 = noise(vPosition * 0.1) * 0.5;
-                    float n3 = noise(vPosition * 0.2) * 0.25;
+                    float stepSize = 0.1;
+                    int numSteps = 64;
                     
-                    float totalNoise = (n1 + n2 + n3) * density;
-                    totalNoise = smoothstep(0.3, 0.8, totalNoise);
+                    float transmittance = 1.0;
+                    vec3 scatteredLight = vec3(0.0);
                     
-                    vec3 cloudColor = mix(vec3(0.9, 0.9, 1.0), vec3(1.0, 1.0, 1.0), NdotL);
-                    cloudColor = mix(vec3(0.6, 0.6, 0.8), cloudColor, totalNoise);
+                    // Raymarching through the cloud volume
+                    for(int i = 0; i < 64; i++) {
+                        if(i >= numSteps) break;
+                        
+                        vec3 currentPos = rayStart + rayDir * float(i) * stepSize;
+                        
+                        // Get cloud density at current position
+                        float cloudDensity = getCloudDensity(currentPos);
+                        
+                        if(cloudDensity > 0.01) {
+                            // Light sampling
+                            float lightRaySteps = 16.0;
+                            float lightTransmittance = 1.0;
+                            
+                            for(int j = 0; j < 16; j++) {
+                                vec3 lightPos = currentPos + lightDirection * float(j) * 0.2;
+                                float lightDensity = getCloudDensity(lightPos);
+                                lightTransmittance *= exp(-lightDensity * 0.1);
+                            }
+                            
+                            // Phase function for scattering
+                            float cosTheta = dot(rayDir, lightDirection);
+                            float phase = mix(henyeyGreenstein(cosTheta, 0.3), henyeyGreenstein(cosTheta, -0.3), 0.7);
+                            
+                            // Add scattered light
+                            vec3 lightContribution = cloudColor * lightTransmittance * phase * cloudDensity;
+                            scatteredLight += lightContribution * transmittance * stepSize;
+                            
+                            // Update transmittance
+                            transmittance *= exp(-cloudDensity * stepSize * 2.0);
+                        }
+                        
+                        if(transmittance < 0.01) break;
+                    }
                     
-                    float alpha = totalNoise * opacity;
-                    gl_FragColor = vec4(cloudColor, alpha);
+                    // Final color with atmospheric perspective
+                    vec3 finalColor = scatteredLight;
+                    float alpha = 1.0 - transmittance;
+                    alpha *= opacity;
+                    
+                    // Add some ambient lighting to shadows
+                    finalColor = mix(finalColor, shadowColor, (1.0 - alpha) * 0.1);
+                    
+                    gl_FragColor = vec4(finalColor, alpha);
                 }
             `,
             transparent: true,
             depthWrite: false,
-            blending: THREE.NormalBlending
+            side: THREE.DoubleSide
         });
         
-        // Wispy cloud material
-        const cloudMaterial2 = new THREE.ShaderMaterial({
-            uniforms: {
-                time: { value: 0 },
-                density: { value: 0.7 },
-                opacity: { value: 0.6 }
-            },
-            vertexShader: cloudMaterial1.vertexShader,
-            fragmentShader: `
-                varying vec3 vPosition;
-                varying vec3 vNormal;
-                uniform float time;
-                uniform float density;
-                uniform float opacity;
-                
-                float noise(vec3 p) {
-                    return sin(p.x * 4.0 + time * 0.3) * sin(p.y * 3.5 + time * 0.2) * sin(p.z * 3.8 + time * 0.25) * 0.5 + 0.5;
-                }
-                
-                void main() {
-                    vec3 lightDir = normalize(vec3(1.0, 1.0, 0.5));
-                    float NdotL = dot(vNormal, lightDir) * 0.5 + 0.5;
-                    
-                    float n1 = noise(vPosition * 0.08);
-                    float n2 = noise(vPosition * 0.15) * 0.7;
-                    float n3 = noise(vPosition * 0.3) * 0.4;
-                    
-                    float totalNoise = (n1 + n2 + n3) * density;
-                    totalNoise = smoothstep(0.2, 0.9, totalNoise);
-                    
-                    vec3 cloudColor = mix(vec3(0.95, 0.95, 1.0), vec3(1.0, 1.0, 1.0), NdotL);
-                    cloudColor = mix(vec3(0.7, 0.7, 0.9), cloudColor, totalNoise);
-                    
-                    float alpha = totalNoise * opacity * 0.8;
-                    gl_FragColor = vec4(cloudColor, alpha);
-                }
-            `,
-            transparent: true,
-            depthWrite: false,
-            blending: THREE.AdditiveBlending
-        });
-        
-        this.cloudMaterials = [cloudMaterial1, cloudMaterial2];
+        this.cloudMaterials = [volumetricCloudMaterial];
     }
     
     createCloudCluster(x, y, z) {
-        const clusterSize = Math.random() * 3 + 2;
+        const clusterSize = Math.random() * 2 + 1;
         const cluster = new THREE.Group();
         
         for (let i = 0; i < clusterSize; i++) {
-            const cloudGeometry = new THREE.SphereGeometry(
-                Math.random() * 8 + 4,
-                16,
-                12
+            // Use box geometry for better volumetric rendering
+            const cloudGeometry = new THREE.BoxGeometry(
+                Math.random() * 12 + 8,
+                Math.random() * 8 + 6,
+                Math.random() * 12 + 8
             );
             
-            const material = this.cloudMaterials[Math.floor(Math.random() * this.cloudMaterials.length)].clone();
+            const material = this.cloudMaterials[0].clone();
             const cloud = new THREE.Mesh(cloudGeometry, material);
             
             cloud.position.set(
-                (Math.random() - 0.5) * 20,
-                (Math.random() - 0.5) * 8,
-                (Math.random() - 0.5) * 20
+                (Math.random() - 0.5) * 25,
+                (Math.random() - 0.5) * 10,
+                (Math.random() - 0.5) * 25
             );
             
             cloud.scale.set(
-                Math.random() * 0.8 + 0.6,
-                Math.random() * 0.6 + 0.4,
-                Math.random() * 0.8 + 0.6
+                Math.random() * 0.6 + 0.8,
+                Math.random() * 0.4 + 0.6,
+                Math.random() * 0.6 + 0.8
+            );
+            
+            // Random rotation for variety
+            cloud.rotation.set(
+                Math.random() * 0.5,
+                Math.random() * Math.PI * 2,
+                Math.random() * 0.5
             );
             
             cluster.add(cloud);
@@ -402,6 +520,8 @@ class CloudScene {
             cluster.children.forEach(cloud => {
                 if (cloud.material.uniforms) {
                     cloud.material.uniforms.time.value = this.time;
+                    cloud.material.uniforms.cameraPosition.value.copy(this.camera.position);
+                    cloud.material.uniforms.lightDirection.value.copy(this.sunLight.position).normalize();
                 }
             });
         });
@@ -427,4 +547,3 @@ class CloudScene {
 
 // Initialize the cloud scene
 new CloudScene();
-
